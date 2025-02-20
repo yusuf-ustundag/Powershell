@@ -1,0 +1,608 @@
+# Active Directory Organizational Units ( OU ) Owner Change 
+# AD OU Owner Manager GUI
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.DirectoryServices
+
+# Import required modules
+Import-Module ActiveDirectory
+
+# Create Logs Directory
+$scriptPath = $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrEmpty($scriptPath)) {
+    $scriptPath = $PWD.Path
+}
+else {
+    $scriptPath = Split-Path -Parent -Path $scriptPath
+}
+
+Write-Host "Script running from: $scriptPath"
+
+# Define paths
+$logsPath = Join-Path -Path $scriptPath -ChildPath "Logs"
+$reportsPath = Join-Path -Path $scriptPath -ChildPath "Reports"
+$backupsPath = Join-Path -Path $scriptPath -ChildPath "Backups"
+
+# Create directories if they don't exist
+$directories = @($logsPath, $reportsPath, $backupsPath)
+foreach ($dir in $directories) {
+    if (-not (Test-Path -Path $dir)) {
+        Write-Host "Creating directory: $dir"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+}
+
+# Set Directory Services Configuration
+$searcher = [System.DirectoryServices.DirectorySearcher]::new()
+$searcher.PageSize = 1000
+$searcher.ReferralChasing = [System.DirectoryServices.ReferralChasingOption]::All
+$searcher.Dispose()
+
+# Helper function to get proper LDAP path
+function Get-LDAPPath {
+    param (
+        [string]$DistinguishedName
+    )
+    try {
+        if ([string]::IsNullOrEmpty($DistinguishedName)) {
+            throw "Distinguished Name is empty"
+        }
+        # Get domain information
+        $domain = Get-ADDomain
+        $domainDN = $domain.DistinguishedName
+        
+        # If DN doesn't contain domain DN, append it
+        if ($DistinguishedName -notlike "*$domainDN") {
+            $DistinguishedName = "$DistinguishedName,$domainDN"
+        }
+        
+        return "LDAP://$DistinguishedName"
+    }
+    catch {
+        throw "Error creating LDAP path: $($_.Exception.Message)"
+    }
+}
+
+# Function to get ACL safely with proper resource cleanup
+function Get-SafeACL {
+    param (
+        [string]$DistinguishedName
+    )
+    $directoryEntry = $null
+    try {
+        $ldapPath = Get-LDAPPath $DistinguishedName
+        $directoryEntry = [System.DirectoryServices.DirectoryEntry]::new($ldapPath)
+        $directoryEntry.RefreshCache()
+        
+        if ($null -eq $directoryEntry.Path) {
+            throw "Could not bind to $ldapPath"
+        }
+        
+        # Get the raw security descriptor
+        $securityDescriptor = $directoryEntry.ObjectSecurity
+        
+        # Get owner SID and try to translate it
+        $ownerSid = $securityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier])
+        try {
+            $owner = $ownerSid.Translate([System.Security.Principal.NTAccount]).Value
+        }
+        catch {
+            $owner = $ownerSid.Value
+        }
+        
+        # Get access rules and translate SIDs where possible
+        $accessRules = $securityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+        $translatedRules = @()
+        
+        foreach ($rule in $accessRules) {
+            try {
+                $sid = [System.Security.Principal.SecurityIdentifier]$rule.IdentityReference
+                $ntAccount = $sid.Translate([System.Security.Principal.NTAccount]).Value
+                
+                $translatedRules += [PSCustomObject]@{
+                    IdentityReference = $ntAccount
+                    ActiveDirectoryRights = $rule.ActiveDirectoryRights
+                    AccessControlType = $rule.AccessControlType
+                    IsInherited = $rule.IsInherited
+                }
+            }
+            catch {
+                # If translation fails, use SID
+                $translatedRules += [PSCustomObject]@{
+                    IdentityReference = $rule.IdentityReference.Value
+                    ActiveDirectoryRights = $rule.ActiveDirectoryRights
+                    AccessControlType = $rule.AccessControlType
+                    IsInherited = $rule.IsInherited
+                }
+            }
+        }
+        
+        return @{
+            Access = $translatedRules
+            Owner = $owner
+            OwnerSid = $ownerSid
+        }
+    }
+    catch {
+        throw "Error getting ACL for $DistinguishedName : $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $directoryEntry) {
+            $directoryEntry.Dispose()
+        }
+    }
+}
+
+# Function to set ACL safely with proper resource cleanup
+function Set-SafeACL {
+    param (
+        [string]$DistinguishedName,
+        [System.Security.Principal.NTAccount]$NewOwner
+    )
+    $directoryEntry = $null
+    try {
+        $ldapPath = Get-LDAPPath $DistinguishedName
+        $directoryEntry = [System.DirectoryServices.DirectoryEntry]::new($ldapPath)
+        $directoryEntry.RefreshCache()
+        
+        if ($null -eq $directoryEntry.Path) {
+            throw "Could not bind to $ldapPath"
+        }
+        
+        # Convert NTAccount to SID first
+        try {
+            $sid = $NewOwner.Translate([System.Security.Principal.SecurityIdentifier])
+            $directoryEntry.ObjectSecurity.SetOwner($sid)
+        }
+        catch {
+            throw "Could not translate account $NewOwner to SID: $($_.Exception.Message)"
+        }
+        
+        $directoryEntry.CommitChanges()
+        return $true
+    }
+    catch {
+        throw "Error setting ACL for $DistinguishedName : $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $directoryEntry) {
+            $directoryEntry.Dispose()
+        }
+    }
+}
+
+# Form settings
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "AD OU Owner Manager"
+$form.Size = New-Object System.Drawing.Size(800,600)
+$form.StartPosition = "CenterScreen"
+$form.BackColor = [System.Drawing.Color]::FromArgb(240,240,240)
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$form.ShowIcon = $false
+
+# Processing Panel (White Background)
+$processPanel = New-Object System.Windows.Forms.Panel
+$processPanel.Location = New-Object System.Drawing.Point(20,460)
+$processPanel.Size = New-Object System.Drawing.Size(740,30)
+$processPanel.BackColor = [System.Drawing.Color]::White
+$processPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$form.Controls.Add($processPanel)
+
+# Flow Label (Inside Process Panel)
+$flowLabel = New-Object System.Windows.Forms.Label
+$flowLabel.Location = New-Object System.Drawing.Point(5,2)
+$flowLabel.Size = New-Object System.Drawing.Size(725,24)
+$flowLabel.TextAlign = "MiddleLeft"
+$flowLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$flowLabel.BackColor = [System.Drawing.Color]::Transparent
+$processPanel.Controls.Add($flowLabel)
+
+# Progress Bar
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Location = New-Object System.Drawing.Point(20,500)
+$progressBar.Size = New-Object System.Drawing.Size(740,30)
+$progressBar.Style = "Continuous"
+$form.Controls.Add($progressBar)
+
+# Status Label
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Location = New-Object System.Drawing.Point(20,540)
+$statusLabel.Size = New-Object System.Drawing.Size(650,30)
+$statusLabel.TextAlign = "MiddleLeft"
+$form.Controls.Add($statusLabel)
+
+# Group Box - Report
+$groupBox1 = New-Object System.Windows.Forms.GroupBox
+$groupBox1.Location = New-Object System.Drawing.Point(20,20)
+$groupBox1.Size = New-Object System.Drawing.Size(360,420)
+$groupBox1.Text = "OU Owner Report"
+$form.Controls.Add($groupBox1)
+
+# Create Report Button
+$btnCreateReport = New-Object System.Windows.Forms.Button
+$btnCreateReport.Location = New-Object System.Drawing.Point(20,30)
+$btnCreateReport.Size = New-Object System.Drawing.Size(320,40)
+$btnCreateReport.Text = "Generate OU Owner Report"
+$btnCreateReport.BackColor = [System.Drawing.Color]::FromArgb(0,122,204)
+$btnCreateReport.ForeColor = [System.Drawing.Color]::White
+$btnCreateReport.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$groupBox1.Controls.Add($btnCreateReport)
+
+# Recent Reports ListBox
+$listBoxReports = New-Object System.Windows.Forms.ListBox
+$listBoxReports.Location = New-Object System.Drawing.Point(20,80)
+$listBoxReports.Size = New-Object System.Drawing.Size(320,320)
+$groupBox1.Controls.Add($listBoxReports)
+
+# Group Box - Owner Change
+$groupBox2 = New-Object System.Windows.Forms.GroupBox
+$groupBox2.Location = New-Object System.Drawing.Point(400,20)
+$groupBox2.Size = New-Object System.Drawing.Size(360,420)
+$groupBox2.Text = "Change OU Owner"
+$form.Controls.Add($groupBox2)
+
+# Admin Groups ComboBox
+$comboGroups = New-Object System.Windows.Forms.ComboBox
+$comboGroups.Location = New-Object System.Drawing.Point(20,30)
+$comboGroups.Size = New-Object System.Drawing.Size(320,30)
+$comboGroups.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$groupBox2.Controls.Add($comboGroups)
+
+# Change Owner Button
+$btnChangeOwner = New-Object System.Windows.Forms.Button
+$btnChangeOwner.Location = New-Object System.Drawing.Point(20,70)
+$btnChangeOwner.Size = New-Object System.Drawing.Size(320,40)
+$btnChangeOwner.Text = "Change Owner with Selected Group"
+$btnChangeOwner.BackColor = [System.Drawing.Color]::FromArgb(0,122,204)
+$btnChangeOwner.ForeColor = [System.Drawing.Color]::White
+$btnChangeOwner.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$groupBox2.Controls.Add($btnChangeOwner)
+
+# Operation Logs TextBox
+$txtLogs = New-Object System.Windows.Forms.TextBox
+$txtLogs.Location = New-Object System.Drawing.Point(20,120)
+$txtLogs.Size = New-Object System.Drawing.Size(320,280)
+$txtLogs.Multiline = $true
+$txtLogs.ScrollBars = "Vertical"
+$txtLogs.ReadOnly = $true
+$groupBox2.Controls.Add($txtLogs)
+
+# Exit Button
+$btnExit = New-Object System.Windows.Forms.Button
+$btnExit.Location = New-Object System.Drawing.Point(680,540)
+$btnExit.Size = New-Object System.Drawing.Size(80,30)
+$btnExit.Text = "Exit"
+$btnExit.BackColor = [System.Drawing.Color]::FromArgb(220,53,69)
+$btnExit.ForeColor = [System.Drawing.Color]::White
+$btnExit.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$form.Controls.Add($btnExit)
+
+function Update-FlowStatus {
+    param (
+        [string]$Status,
+        [string]$Color = "Blue"
+    )
+    $flowLabel.Text = "→ $Status"
+    switch ($Color) {
+        "Blue" { 
+            $flowLabel.ForeColor = [System.Drawing.Color]::FromArgb(0,122,204)
+            $processPanel.BackColor = [System.Drawing.Color]::FromArgb(242,249,255)
+        }
+        "Green" { 
+            $flowLabel.ForeColor = [System.Drawing.Color]::FromArgb(40,167,69)
+            $processPanel.BackColor = [System.Drawing.Color]::FromArgb(242,255,245)
+        }
+        "Red" { 
+            $flowLabel.ForeColor = [System.Drawing.Color]::FromArgb(220,53,69)
+            $processPanel.BackColor = [System.Drawing.Color]::FromArgb(255,242,242)
+        }
+        "Orange" { 
+            $flowLabel.ForeColor = [System.Drawing.Color]::FromArgb(255,193,7)
+            $processPanel.BackColor = [System.Drawing.Color]::FromArgb(255,248,242)
+        }
+    }
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+# Event Handlers
+$btnCreateReport.Add_Click({
+    try {
+        Update-FlowStatus "Initializing report generation..." "Blue"
+        $statusLabel.Text = "Generating report..."
+        $progressBar.Value = 0
+        $dateStamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
+        $exportPath = Join-Path -Path $reportsPath -ChildPath "OU_Detailed_Report_$dateStamp.csv"
+        
+        Update-FlowStatus "Fetching OU information..." "Blue"
+        $OUs = Get-ADOrganizationalUnit -Filter * -Properties * -ResultSetSize $null
+        $totalOUs = $OUs.Count
+        $currentOU = 0
+        $Results = @()
+        
+        # Create summary information
+        $summaryInfo = @{
+            TotalOUs = $totalOUs
+            StartTime = Get-Date
+            Domain = (Get-ADDomain).DNSRoot
+        }
+        
+        foreach ($OU in $OUs) {
+            $currentOU++
+            $progressBar.Value = [math]::Round(($currentOU / $totalOUs) * 100)
+            Update-FlowStatus "Processing: $($OU.Name) ($currentOU of $totalOUs)" "Blue"
+            $statusLabel.Text = "Processing: $($OU.DistinguishedName)"
+            
+            try {
+                $aclInfo = Get-SafeACL -DistinguishedName $OU.DistinguishedName
+                $owner = $aclInfo.Owner
+                $fullControlUsers = ($aclInfo.Access | Where-Object {
+                    $_.ActiveDirectoryRights -eq "GenericAll" -or 
+                    ($_.ActiveDirectoryRights -match "FullControl")
+                }).IdentityReference.Value -join '; '
+
+                $Results += [PSCustomObject]@{
+                    'OU_Name' = $OU.Name
+                    'OU_DistinguishedName' = $OU.DistinguishedName
+                    'Owner' = $owner
+                    'Created' = $OU.Created
+                    'Modified' = $OU.Modified
+                    'FullControlUsers' = $fullControlUsers
+                    'ProtectedFromAccidentalDeletion' = $OU.ProtectedFromAccidentalDeletion
+                    'ReportGeneratedAt' = (Get-Date).ToString()
+                }
+                
+                [System.GC]::Collect()
+            }
+            catch {
+                $txtLogs.AppendText("Error: $($OU.DistinguishedName) - $($_.Exception.Message)`r`n")
+            }
+        }
+        
+        Update-FlowStatus "Saving report..." "Orange"
+        
+        # Add summary to the beginning of the report
+        $summaryInfo.EndTime = Get-Date
+        $summaryInfo.Duration = $summaryInfo.EndTime - $summaryInfo.StartTime
+        
+        # Create summary report
+        $summaryReport = Join-Path -Path $reportsPath -ChildPath "Summary_$dateStamp.txt"
+        @"
+Report Summary
+-------------
+Total OUs: $($summaryInfo.TotalOUs)
+Domain: $($summaryInfo.Domain)
+Start Time: $($summaryInfo.StartTime)
+End Time: $($summaryInfo.EndTime)
+Duration: $($summaryInfo.Duration)
+"@ | Out-File -FilePath $summaryReport -Encoding UTF8
+        
+        # Save detailed report
+        $Results | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
+        
+        $statusLabel.Text = "Report generated: $exportPath"
+        $listBoxReports.Items.Clear()
+        Get-ChildItem -Path $reportsPath -Filter "OU_Detailed_Report_*.csv" | ForEach-Object {
+            $listBoxReports.Items.Add($_.Name)
+        }
+        
+        Update-FlowStatus "Report generation completed!" "Green"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Report generated successfully.`nDetailed Report: $exportPath`nSummary: $summaryReport", 
+            "Success", 
+            [System.Windows.Forms.MessageBoxButtons]::OK, 
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+    catch {
+        Update-FlowStatus "Error occurred during report generation!" "Red"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+    finally {
+        $progressBar.Value = 0
+        [System.GC]::Collect()
+    }
+})
+
+$btnChangeOwner.Add_Click({
+    if ($comboGroups.SelectedItem -eq $null) {
+        [System.Windows.Forms.MessageBox]::Show("Please select a group.", "Warning", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+    
+    $result = [System.Windows.Forms.MessageBox]::Show("This will change the owner of OUs to the selected group. Continue?", "Confirm", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($result -eq [System.Windows.Forms.DialogResult]::No) {
+        return
+    }
+    
+    try {
+        Update-FlowStatus "Initializing owner change process..." "Blue"
+        $statusLabel.Text = "Analyzing owners..."
+        $progressBar.Value = 0
+        $dateStamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
+        $logFile = Join-Path -Path $logsPath -ChildPath "OU_Owner_Changes_$dateStamp.log"
+        $backupFile = Join-Path -Path $backupsPath -ChildPath "OU_Owners_Backup_$dateStamp.csv"
+        
+        # Get new owner information and convert to SID for comparison
+        $NewOwnerGroup = $comboGroups.SelectedItem.ToString()
+        $NewOwnerAccount = [System.Security.Principal.NTAccount]$NewOwnerGroup
+        $NewOwnerSID = $NewOwnerAccount.Translate([System.Security.Principal.SecurityIdentifier])
+        
+        # Start logging
+        "Owner change process started at $(Get-Date)" | Out-File -FilePath $logFile
+        "Selected new owner: $NewOwnerGroup (SID: $($NewOwnerSID.Value))" | Out-File -FilePath $logFile -Append
+        
+        # First pass: Analyze and identify OUs that need changes
+        Update-FlowStatus "Analyzing current owners..." "Orange"
+        $txtLogs.AppendText("Analyzing current owners...`r`n")
+        
+        $OUs = Get-ADOrganizationalUnit -Filter * -ResultSetSize $null
+        $totalOUs = $OUs.Count
+        $currentOU = 0
+        $OUsToChange = @()
+        $backupData = @()
+        $sameOwnerCount = 0
+        
+        foreach ($OU in $OUs) {
+            $currentOU++
+            $progressBar.Value = [math]::Round(($currentOU / $totalOUs) * 100)
+            Update-FlowStatus "Analyzing: $($OU.Name) ($currentOU of $totalOUs)" "Blue"
+            
+            try {
+                $aclInfo = Get-SafeACL -DistinguishedName $OU.DistinguishedName
+                $currentOwner = $aclInfo.Owner
+                $currentOwnerSID = $aclInfo.OwnerSid
+                
+                # Create backup entry
+                $backupData += [PSCustomObject]@{
+                    'OU_Name' = $OU.Name
+                    'OU_DistinguishedName' = $OU.DistinguishedName
+                    'Previous_Owner' = $currentOwner
+                    'Previous_Owner_SID' = $currentOwnerSID.Value
+                    'Backup_Time' = (Get-Date).ToString()
+                }
+                
+                # Compare SIDs instead of names
+                if ($currentOwnerSID.Value -ne $NewOwnerSID.Value) {
+                    $OUsToChange += $OU
+                    $message = "Will change: $($OU.DistinguishedName) (Current: $currentOwner [SID: $($currentOwnerSID.Value)])"
+                    $txtLogs.AppendText("$message`r`n")
+                    $message | Out-File -FilePath $logFile -Append
+                }
+                else {
+                    $sameOwnerCount++
+                }
+            }
+            catch {
+                $message = "Analysis Error: $($OU.DistinguishedName) - $($_.Exception.Message)"
+                $txtLogs.AppendText("$message`r`n")
+                $message | Out-File -FilePath $logFile -Append
+            }
+        }
+        
+        # Save backup
+        $backupData | Export-Csv -Path $backupFile -NoTypeInformation -Encoding UTF8
+        
+        # Process changes only for OUs that need it
+        $totalChanges = $OUsToChange.Count
+        if ($totalChanges -eq 0) {
+            $message = "No changes needed. All $sameOwnerCount OUs already have $NewOwnerGroup as owner."
+            Update-FlowStatus "No changes needed!" "Green"
+            $txtLogs.AppendText("$message`r`n")
+            $message | Out-File -FilePath $logFile -Append
+            [System.Windows.Forms.MessageBox]::Show($message, "Information", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            return
+        }
+        
+        # Confirm changes
+        $confirmMessage = "Found $totalChanges OUs that need owner change:`n"
+        $confirmMessage += "$sameOwnerCount OUs already have correct owner`n`n"
+        $confirmMessage += "Do you want to proceed with changing $totalChanges OUs?"
+        
+        $confirmResult = [System.Windows.Forms.MessageBox]::Show(
+            $confirmMessage,
+            "Confirm Changes",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        
+        if ($confirmResult -eq [System.Windows.Forms.DialogResult]::No) {
+            $message = "Operation cancelled by user"
+            Update-FlowStatus $message "Orange"
+            $txtLogs.AppendText("$message`r`n")
+            $message | Out-File -FilePath $logFile -Append
+            return
+        }
+        
+        Update-FlowStatus "Processing owner changes..." "Blue"
+        $message = "`nStarting owner changes for $totalChanges OUs..."
+        $txtLogs.AppendText("$message`r`n")
+        $message | Out-File -FilePath $logFile -Append
+        $currentChange = 0
+        $successCount = 0
+        $errorCount = 0
+        
+        foreach ($OU in $OUsToChange) {
+            $currentChange++
+            $progressBar.Value = [math]::Round(($currentChange / $totalChanges) * 100)
+            Update-FlowStatus "Changing owner: $($OU.Name) ($currentChange of $totalChanges)" "Blue"
+            $statusLabel.Text = "Processing: $($OU.DistinguishedName)"
+            
+            try {
+                Set-SafeACL -DistinguishedName $OU.DistinguishedName -NewOwner $NewOwnerAccount
+                $successCount++
+                $message = "Changed: $($OU.DistinguishedName) -> $NewOwnerGroup"
+                $txtLogs.AppendText("$message`r`n")
+                $message | Out-File -FilePath $logFile -Append
+            }
+            catch {
+                $errorCount++
+                $message = "Error: $($OU.DistinguishedName) - $($_.Exception.Message)"
+                $txtLogs.AppendText("$message`r`n")
+                $message | Out-File -FilePath $logFile -Append
+            }
+        }
+        
+        # Write summary to log
+        @"
+`nOperation Summary
+-----------------
+Total OUs Analyzed: $totalOUs
+OUs with Correct Owner: $sameOwnerCount
+OUs Requiring Change: $totalChanges
+Successfully Changed: $successCount
+Errors Encountered: $errorCount
+Operation Completed: $(Get-Date)
+"@ | Out-File -FilePath $logFile -Append
+        
+        Update-FlowStatus "Owner change process completed!" "Green"
+        $statusLabel.Text = "Operation completed"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Owner change completed.`nTotal OUs: $totalOUs`nAlready Correct: $sameOwnerCount`nChanged: $successCount`nErrors: $errorCount`n`nLog: $logFile`nBackup: $backupFile", 
+            "Success", 
+            [System.Windows.Forms.MessageBoxButtons]::OK, 
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+    catch {
+        Update-FlowStatus "Error occurred during owner change!" "Red"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+    finally {
+        $progressBar.Value = 0
+        [System.GC]::Collect()
+    }
+})
+
+# Exit Button Handler
+$btnExit.Add_Click({ $form.Close() })
+
+# Form load event - Load admin groups
+$form.Add_Shown({
+    try {
+        Update-FlowStatus "Loading admin groups..." "Blue"
+        $adminGroups = Get-ADGroup -Filter {AdminCount -eq 1} | Select-Object -ExpandProperty Name
+        $comboGroups.Items.AddRange($adminGroups)
+        
+        Update-FlowStatus "Loading existing reports..." "Blue"
+        Get-ChildItem -Path $reportsPath -Filter "OU_Detailed_Report_*.csv" | ForEach-Object {
+            $listBoxReports.Items.Add($_.Name)
+        }
+        
+        Update-FlowStatus "Ready" "Green"
+    }
+    catch {
+        Update-FlowStatus "Error loading initial data!" "Red"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+})
+
+# Hover effects
+$btnCreateReport.Add_MouseEnter({ $this.BackColor = [System.Drawing.Color]::FromArgb(0,102,184) })
+$btnCreateReport.Add_MouseLeave({ $this.BackColor = [System.Drawing.Color]::FromArgb(0,122,204) })
+$btnChangeOwner.Add_MouseEnter({ $this.BackColor = [System.Drawing.Color]::FromArgb(0,102,184) })
+$btnChangeOwner.Add_MouseLeave({ $this.BackColor = [System.Drawing.Color]::FromArgb(0,122,204) })
+$btnExit.Add_MouseEnter({ $this.BackColor = [System.Drawing.Color]::FromArgb(200,33,49) })
+$btnExit.Add_MouseLeave({ $this.BackColor = [System.Drawing.Color]::FromArgb(220,53,69) })
+
+# Show form
+$form.ShowDialog() 
