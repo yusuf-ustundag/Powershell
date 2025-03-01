@@ -1,0 +1,86 @@
+ # Get the current date for file naming
+$date = Get-Date -Format "yyyyMMdd_HHmmss"
+
+# CSV file path
+$csvPath = "C:\script\ADOps\AddUserDG\AddUser.csv"
+
+# Distribution Group Name
+$groupName = "Test Distribution Group"
+
+# Output files (before and after)
+$beforeCsv = "C:\script\ADOps\AddUserDG\${groupName}_before_$date.csv"
+$afterCsv = "C:\script\ADOps\AddUserDG\${groupName}_after_$date.csv"
+
+# Save group members before processing
+Get-ADGroupMember -Identity $groupName | Select-Object Name, SamAccountName, DistinguishedName |
+    Export-Csv -Path $beforeCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "📂 Group members before processing saved: $beforeCsv" -ForegroundColor Cyan
+
+# Read CSV file
+$users = Import-Csv -Path $csvPath
+
+# Get existing group members
+$existingMembers = Get-ADGroupMember -Identity $groupName | Select-Object -ExpandProperty SamAccountName
+
+# Lists for processing results
+$addedUsers = @()
+$alreadyInGroup = @()
+$notFoundUsers = @()
+
+# Add users to the group
+foreach ($user in $users) {
+    $email = $user.Email
+
+    if ($email) {
+        # Find the AD user corresponding to the email address
+        $adUser = Get-ADUser -Filter "EmailAddress -eq '$email'" -Properties EmailAddress
+        
+        if ($adUser) {
+            # Check if the user is already in the group
+            if ($existingMembers -contains $adUser.SamAccountName) {
+                Write-Host "Already in group: $email ($($adUser.SamAccountName))" -ForegroundColor Yellow
+                $alreadyInGroup += "$email ($($adUser.SamAccountName))"
+            } else {
+                try {
+                    Add-ADGroupMember -Identity $groupName -Members $adUser.SamAccountName -ErrorAction Stop
+                    Write-Host "Successfully added: $email ($($adUser.SamAccountName))" -ForegroundColor Green
+                    $addedUsers += "$email ($($adUser.SamAccountName))"
+                } catch {
+                    Write-Host "Error occurred: $email - $_" -ForegroundColor Red
+                }
+            }
+        } else {
+            Write-Host "User not found: $email" -ForegroundColor Magenta
+            $notFoundUsers += $email
+        }
+    }
+}
+
+# Save group members after processing
+Get-ADGroupMember -Identity $groupName | Select-Object Name, SamAccountName, DistinguishedName |
+    Export-Csv -Path $afterCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "📂 Group members after processing saved: $afterCsv" -ForegroundColor Cyan
+
+# Processing Summary
+Write-Host "`n=== Processing Summary ===" -ForegroundColor Cyan
+Write-Host "Total Processed Users: $($users.Count)" -ForegroundColor White
+Write-Host "Added Users: $($addedUsers.Count)" -ForegroundColor Green
+Write-Host "Already in Group: $($alreadyInGroup.Count)" -ForegroundColor Yellow
+Write-Host "Users Not Found in AD: $($notFoundUsers.Count)" -ForegroundColor Magenta
+
+if ($addedUsers.Count -gt 0) {
+    Write-Host "`n✅ Added Users:" -ForegroundColor Green
+    $addedUsers | ForEach-Object { Write-Host $_ -ForegroundColor Green }
+}
+
+if ($alreadyInGroup.Count -gt 0) {
+    Write-Host "`n⚠️ Already in Group:" -ForegroundColor Yellow
+    $alreadyInGroup | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+}
+
+if ($notFoundUsers.Count -gt 0) {
+    Write-Host "`n❌ Users Not Found in AD:" -ForegroundColor Magenta
+    $notFoundUsers | ForEach-Object { Write-Host $_ -ForegroundColor Magenta }
+}
